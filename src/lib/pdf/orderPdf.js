@@ -17,27 +17,102 @@ const FOOTER_H = 28
 const LINE = 1.45 // line-height factor; Thai stacks marks above and below the base line
 const COLOR = { text: '#222222', muted: '#666666', rule: '#cccccc', head: '#f0f0f0' }
 
-// pdfkit writes each glyph's Unicode (ToUnicode CMap) from the first time the glyph is shaped.
-// Sarabun's ccmp splits SARA AM (ำ) into NIKHAHIT + SARA AA, and fontkit gives the SARA AA glyph
-// no code points — pdfkit then emits an empty entry and every า in the file extracts as garbage.
-// Map glyphs to their own cmap code points instead, so ำ extracts as its NFKD form ํ + า.
+// Exact text layer for SARA AM (ำ).
+// Sarabun's ccmp splits ำ into NIKHAHIT (or a NIKHAHIT+tone ligature, as in น้ำ) + SARA AA, so a word
+// like คำ becomes three glyphs for two characters. pdfkit maps each glyph to text once (first use),
+// and fontkit caches code points per glyph id, so out of the box every ำ extracts as ํา (and, worse,
+// real า could inherit an empty mapping). A PDF glyph can't map to "no text" either — pdf.js then
+// falls back to the raw code. So, per text run:
+//   - each glyph's text comes from the font itself (cmap, else its uniXXXX name), not from fontkit;
+//   - NIKHAHIT glyphs are matched in order against the ํ / ำ characters of the input. For one that came
+//     from ำ, a plain NIKHAHIT is left out of the text and drawn as a vector path from the same outline
+//     at the same spot (it has zero advance); a NIKHAHIT+tone ligature stays text but maps to the tone
+//     only. The SARA AA right after it maps to U+0E33;
+//   - every distinct (glyph, text) pair gets its own code — the subset just holds a duplicate outline.
+// The page looks exactly as before and text extracts exactly as written.
 const SARA_AM = 0x0e33
+const SARA_AA = 0x0e32
 const NIKHAHIT = 0x0e4d
+
+function glyphCodePoints(font, glyph, inText) {
+  const fromCmap = font.font._cmapProcessor.codePointsForGlyph(glyph.id)
+  if (fromCmap.length) return [fromCmap.find((c) => inText.has(c)) ?? fromCmap[0]]
+  const m = /^uni((?:[0-9A-F]{4})+)(?:\..*)?$/.exec(glyph.name || '')
+  if (m) return m[1].match(/.{4}/g).map((h) => parseInt(h, 16))
+  return glyph.codePoints.length ? glyph.codePoints : [0xfffd]
+}
 
 function fixToUnicode(font) {
   if (!font || font.__thaiToUnicode || typeof font.encode !== 'function') return
   font.__thaiToUnicode = true
-  const encode = font.encode.bind(font)
-  font.encode = (text, features) => {
-    const { glyphs } = font.layout(text, features)
-    for (const glyph of glyphs) {
-      const gid = font.subset.includeGlyph(glyph.id)
-      if (font.unicode[gid] != null) continue
-      let cps = glyph.codePoints.map((c) => (c === SARA_AM ? NIKHAHIT : c)) // the า half is its own glyph
-      if (!cps.length) cps = font.font._cmapProcessor.codePointsForGlyph(glyph.id)
-      font.unicode[gid] = cps.length ? cps : [0xfffd]
+  font.pendingMarks = [] // NIKHAHITs left out of the last encode(), for drawText() to paint
+  const codes = new Map() // `${glyphId}:${codePoints}` → PDF code (subset index)
+
+  function codeFor(glyph, cps) {
+    const key = `${glyph.id}:${cps.join(',')}`
+    let code = codes.get(key)
+    if (code === undefined) {
+      if (font.subset.mapping[glyph.id] === undefined) {
+        code = font.subset.includeGlyph(glyph.id)
+      } else {
+        font.subset.glyphs.push(glyph.id) // same outline, new code
+        code = font.subset.glyphs.length - 1
+      }
+      codes.set(key, code)
+      font.widths[code] = glyph.advanceWidth * font.scale
+      font.unicode[code] = cps
     }
-    return encode(text, features)
+    return code
+  }
+
+  font.encode = (text, features) => {
+    const { glyphs, positions } = font.layout(text, features)
+    const chars = Array.from(text, (ch) => ch.codePointAt(0))
+    const inText = new Set(chars)
+    const nikhahitSources = chars.filter((c) => c === NIKHAHIT || c === SARA_AM) // in input order
+    const encoded = []
+    const kept = []
+    let x = 0 // pen position in 1/1000 em
+    let saraAmPending = false
+    font.pendingMarks = []
+    glyphs.forEach((glyph, i) => {
+      const pos = positions[i]
+      let cps = glyphCodePoints(font, glyph, inText)
+      if (cps.includes(NIKHAHIT) && nikhahitSources.shift() === SARA_AM) {
+        cps = cps.filter((c) => c !== NIKHAHIT)
+        saraAmPending = true
+      } else if (saraAmPending && cps.length === 1 && cps[0] === SARA_AA) {
+        cps = [SARA_AM]
+        saraAmPending = false
+      }
+      if (cps.length || pos.xAdvance !== 0) {
+        encoded.push(`0000${codeFor(glyph, cps.length ? cps : [0xfffd]).toString(16)}`.slice(-4))
+        kept.push(pos)
+      } else {
+        font.pendingMarks.push({ glyph, x: x + pos.xOffset, y: pos.yOffset })
+      }
+      x += pos.xAdvance
+    })
+    return [encoded, kept]
+  }
+}
+
+// doc.text() for a single line at (x, top) plus the NIKHAHIT paths its encode() left out
+function drawText(doc, text, x, top) {
+  doc.text(text, x, top, { lineBreak: false })
+  const font = doc._font
+  const marks = font.pendingMarks || []
+  if (!marks.length) return
+  font.pendingMarks = []
+  const size = doc._fontSize
+  const k = size / font.font.unitsPerEm
+  const baseline = top + (font.ascender / 1000) * size
+  for (const m of marks) {
+    doc.save()
+    doc.translate(x + (m.x / 1000) * size, baseline - (m.y / 1000) * size)
+    doc.scale(k, -k)
+    doc.path(m.glyph.path.toSVG()).fill()
+    doc.restore()
   }
 }
 
@@ -69,7 +144,7 @@ export function buildOrderPdf(order, { now = new Date() } = {}) {
     const lh = size * LINE
     lines.forEach((ln, i) => {
       const dx = align === 'right' ? w - doc.widthOfString(ln) : 0
-      doc.text(ln, x + dx, top + i * lh, { lineBreak: false })
+      drawText(doc, ln, x + dx, top + i * lh)
     })
     return lines.length * lh
   }
