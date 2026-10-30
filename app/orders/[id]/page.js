@@ -4,6 +4,7 @@ import { useEffect, useState } from 'react'
 import Link from 'next/link'
 import { useParams, useSearchParams } from 'next/navigation'
 import { useAuth } from '../../../src/contexts/AuthContext'
+import { downloadOrderPdf } from '../../../src/utils/downloadPdf'
 
 export default function OrderDetailPage() {
   const { id } = useParams()
@@ -12,6 +13,8 @@ export default function OrderDetailPage() {
   const { token, loading } = useAuth()
   const [order, setOrder] = useState(null)
   const [error, setError] = useState(null)
+  const [pdfBusy, setPdfBusy] = useState(false)
+  const [pdfError, setPdfError] = useState(false)
 
   useEffect(() => {
     if (loading) return
@@ -22,7 +25,12 @@ export default function OrderDetailPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [loading, token, id])
 
-  function printInvoice() { window.print() }
+  async function downloadPdf() {
+    if (pdfBusy) return
+    setPdfBusy(true)
+    setPdfError(false)
+    try { await downloadOrderPdf(order.id, token) } catch { setPdfError(true) } finally { setPdfBusy(false) }
+  }
 
   if (error) return <div className="container"><div className="empty-state" data-qa="order-error">{error}</div></div>
   if (!order) return <div className="loading" data-qa="loading">Loading order…</div>
@@ -40,10 +48,11 @@ export default function OrderDetailPage() {
       <div className="card" style={{ maxWidth: 820, margin: '20px auto' }} data-qa="order-detail">
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
           <h2 style={{ margin: 0 }}>Order #{order.id}</h2>
-          <button className="btn btn-ghost" data-qa="download-invoice" onClick={printInvoice} style={{ maxWidth: 180 }}>
-            Download / Print Invoice
+          <button className="btn btn-ghost" data-qa="download-invoice" onClick={downloadPdf} disabled={pdfBusy} style={{ maxWidth: 180 }}>
+            {pdfBusy ? 'Generating…' : 'Download PDF'}
           </button>
         </div>
+        {pdfError && <p className="alert-error" data-qa="pdf-error" role="alert">Could not generate PDF. Please try again.</p>}
         <p className="muted">Placed on {new Date(order.created_at).toLocaleString()} · Status: <strong>{order.status}</strong></p>
 
         <div className="confirm-cols" style={{ marginTop: 12 }}>
